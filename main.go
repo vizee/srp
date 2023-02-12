@@ -482,7 +482,7 @@ WantedBy=multi-user.target
 		fatalf("cannot get path of the program:%v", err)
 	}
 
-	args := strings.Join(os.Args[1:], " ")
+	args := strings.Join(flag.Args(), " ")
 	if args != "" {
 		cmdline += " " + args
 	}
