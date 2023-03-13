@@ -65,7 +65,7 @@ func dprintf(foramt string, args ...any) {
 	}
 }
 
-func writeMessage(conn net.Conn, key []byte, payload []byte) error {
+func writeMessage(conn net.Conn, key []byte, payload []byte, timeout time.Duration) error {
 	buf := make([]byte, headerLen+len(payload)+blockPadding(payload))
 	var iv [msgBlockSize]byte
 	_, err := io.ReadFull(rand.Reader, iv[:])
@@ -78,8 +78,13 @@ func writeMessage(conn net.Conn, key []byte, payload []byte) error {
 	}
 	binary.LittleEndian.PutUint32(buf[:4], uint32(len(buf)-headerLen))
 	copy(buf[4:4+msgBlockSize], iv[:])
-
+	if timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	}
 	_, err = conn.Write(buf)
+	if timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
 	return err
 }
 
@@ -113,9 +118,7 @@ func sendHello(conn net.Conn, key []byte, tmpKey []byte) error {
 	copy(buf[helloLen-tmpKeyLen:], tmpKey)
 	sign := sha1.Sum(buf[:helloLen])
 	copy(buf[helloLen:], sign[:])
-	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	defer conn.SetWriteDeadline(time.Time{})
-	return writeMessage(conn, key, buf)
+	return writeMessage(conn, key, buf, 1*time.Second)
 }
 
 func recvHello(conn net.Conn, key []byte) ([]byte, error) {
@@ -132,12 +135,12 @@ func recvHello(conn net.Conn, key []byte) ([]byte, error) {
 	return payload[helloLen-tmpKeyLen : helloLen], nil
 }
 
-func sendObject(conn net.Conn, key []byte, obj any) error {
+func sendObject(conn net.Conn, key []byte, obj any, timeout time.Duration) error {
 	buf, err := json.Marshal(obj)
 	if err != nil {
 		return err
 	}
-	return writeMessage(conn, key, buf)
+	return writeMessage(conn, key, buf, timeout)
 }
 
 func recvObject(conn net.Conn, key []byte, obj any) error {
@@ -169,17 +172,23 @@ func loadKeyData(key string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(key)
 }
 
-type LinkMode struct {
-	key    []byte
-	target string
-	accept chan net.Conn
-	seqs   uint64
+type UserConn struct {
+	conn    net.Conn
+	preRead []byte
 }
 
-func (l *LinkMode) link(rc net.Conn) (bool, net.Conn) {
+type LinkMode struct {
+	preReadNum uint
+	key        []byte
+	accept     chan *UserConn
+	target     string
+	seqs       uint64
+}
+
+func (l *LinkMode) link(ac net.Conn) (bool, *UserConn) {
 	linkSeq := strconv.FormatUint(atomic.AddUint64(&l.seqs, 1), 10)
 
-	tmpKey, err := recvHello(rc, l.key)
+	tmpKey, err := recvHello(ac, l.key)
 	if err != nil {
 		dprintf("link[%s] recvHello: %v", linkSeq, err)
 		return false, nil
@@ -188,70 +197,87 @@ func (l *LinkMode) link(rc net.Conn) (bool, net.Conn) {
 	dprintf("link[%s] received hello: tmpKey=%02x", linkSeq, tmpKey)
 
 	// 握手完成后立即启动读协程，保持对连接状态的感知，等待 TCP 或者合法回复
-	reply := make(chan bool, 1)
+	agentAck := make(chan bool, 1)
 	go func() {
 		var data map[string]any
 		// 这里的读操作是为了感知 TCP 错误，不能设置超时
-		err := recvObject(rc, tmpKey, &data)
+		err := recvObject(ac, tmpKey, &data)
 		if err != nil {
 			dprintf("link[%s] recvObject: %v", linkSeq, err)
 			// 对端在建立连接后会设置 TCP keep-alive，如果连接中间出现故障会读到一个错误
-			close(reply)
+			close(agentAck)
 			return
 		}
 		seq, _ := data["seq"].(string)
 		success, _ := data["success"].(bool)
-		reply <- seq == linkSeq && success
+		agentAck <- seq == linkSeq && success
 	}()
 
-	var uc net.Conn
-	linked := false
+	var uc *UserConn
+	acked := false
 	select {
 	case uc = <-l.accept:
-		uc.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		err := sendObject(rc, tmpKey, map[string]any{
+		err := sendObject(ac, tmpKey, map[string]any{
 			"action": "dial",
 			"seq":    linkSeq,
 			"target": l.target,
-		})
-		uc.SetWriteDeadline(time.Time{})
+		}, 5*time.Second)
 		if err != nil {
 			dprintf("link[%s] sendObject: %v", linkSeq, err)
 			break
 		}
 
 		select {
-		case linked = <-reply:
+		case acked = <-agentAck:
 		case <-time.After(time.Second * 10):
 			// 在读协程中 recvJSON 不能设置超时，在这里感知 dial 超时
 			dprintf("link[%s] dial timeout", linkSeq)
 		}
-	case linked = <-reply:
+	case acked = <-agentAck:
 		dprintf("link[%s] accept cancel", linkSeq)
 	}
 
-	return linked, uc
+	return acked, uc
 }
 
-func (l *LinkMode) handleRemote(rc net.Conn) {
-	linked, uc := l.link(rc)
+func (l *LinkMode) handleAgent(ac net.Conn) {
+	linked, uc := l.link(ac)
 	if !linked {
-		rc.Close()
+		ac.Close()
 		if uc != nil {
-			uc.Close()
+			uc.conn.Close()
 		}
 		return
 	}
 
-	go pipe(rc, uc)
-	pipe(uc, rc)
+	go pipe(uc.conn, ac)
+
+	if len(uc.preRead) > 0 {
+		_, err := ac.Write(uc.preRead)
+		if err != nil {
+			dprintf("link established, send pre-read failed: %v", err)
+			ac.Close()
+			return
+		}
+	}
+	pipe(ac, uc.conn)
 }
 
 func (l *LinkMode) handleConn(conn net.Conn) {
 	// 收到一个用户连接后尝试将它发给其他远程连接建立链接
 	// TODO: 支持读到若干字节数据后再继续流程
+	var preRead []byte
+	if l.preReadNum > 0 {
+		preRead = make([]byte, l.preReadNum)
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, err := io.ReadFull(conn, preRead)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			conn.Close()
+		}
+	}
 	select {
-	case l.accept <- conn:
+	case l.accept <- &UserConn{conn: conn, preRead: preRead}:
 	case <-time.After(time.Second * 30):
 		conn.Close()
 	}
@@ -265,17 +291,19 @@ func fatalf(format string, args ...any) {
 func linkMain() {
 	dprintf("srp link mode")
 	var (
-		listen string
-		remote string
-		target string
-		key    string
+		preReadNum uint
+		listen     string
+		agent      string
+		target     string
+		key        string
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "srp link [option...]\n\n")
 		flag.PrintDefaults()
 	}
+	flag.UintVar(&preReadNum, "preRead", 0, "pre-read bytes")
 	flag.StringVar(&listen, "l", ":7770", "listen")
-	flag.StringVar(&remote, "r", ":7771", "remote")
+	flag.StringVar(&agent, "a", ":7771", "agent")
 	flag.StringVar(&target, "t", "", "target")
 	flag.StringVar(&key, "k", "", "key")
 	flag.Parse()
@@ -289,26 +317,28 @@ func linkMain() {
 	if err != nil {
 		fatalf("serve: %v\n", err)
 	}
-	rln, err := net.Listen("tcp", remote)
+	aln, err := net.Listen("tcp", agent)
 	if err != nil {
 		fatalf("listen remote: %v\n", err)
 	}
 
 	link := &LinkMode{
-		accept: make(chan net.Conn),
-		target: target,
-		key:    rawKey,
+		preReadNum: preReadNum,
+		key:        rawKey,
+		accept:     make(chan *UserConn),
+		target:     target,
+		seqs:       0,
 	}
 
 	go func() {
 		for {
-			rconn, err := rln.Accept()
+			ac, err := aln.Accept()
 			if err != nil {
 				dprintf("remote accept: %v", err)
 				time.Sleep(time.Second)
 				continue
 			}
-			go link.handleRemote(rconn)
+			go link.handleAgent(ac)
 		}
 	}()
 
@@ -338,9 +368,9 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 		return
 	}
 
-	if tc, ok := rc.(*net.TCPConn); ok {
-		tc.SetKeepAlivePeriod(time.Second * 30)
-		tc.SetKeepAlive(true)
+	if c, ok := rc.(*net.TCPConn); ok {
+		c.SetKeepAlivePeriod(time.Second * 30)
+		c.SetKeepAlive(true)
 	}
 
 	var tmpKey [tmpKeyLen]byte
@@ -388,7 +418,7 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 	err = sendObject(rc, tmpKey[:], map[string]any{
 		"seq":     seq,
 		"success": true,
-	})
+	}, 0)
 	if err != nil {
 		dprintf("sendObject: %v", err)
 		return
