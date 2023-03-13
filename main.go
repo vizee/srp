@@ -324,9 +324,10 @@ func linkMain() {
 }
 
 type AgentMode struct {
-	key    []byte
-	remote string
-	target string
+	key         []byte
+	remote      string
+	target      string
+	idleTimeout time.Duration
 }
 
 func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
@@ -335,6 +336,11 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 	if err != nil {
 		dprintf("net.Dial %s: %v", a.remote, err)
 		return
+	}
+
+	if tc, ok := rc.(*net.TCPConn); ok {
+		tc.SetKeepAlivePeriod(time.Second * 30)
+		tc.SetKeepAlive(true)
 	}
 
 	var tmpKey [tmpKeyLen]byte
@@ -346,15 +352,16 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 		return
 	}
 
-	if tc, ok := rc.(*net.TCPConn); ok {
-		tc.SetKeepAlivePeriod(time.Second * 30)
-		tc.SetKeepAlive(true)
-	}
-
 	dprintf("sent hello: tmpKey=%02x", tmpKey[:])
 
+	if a.idleTimeout > 0 {
+		rc.SetReadDeadline(time.Now().Add(a.idleTimeout))
+	}
 	var data map[string]any
 	err = recvObject(rc, tmpKey[:], &data)
+	if a.idleTimeout > 0 {
+		rc.SetReadDeadline(time.Time{})
+	}
 	if err != nil {
 		dprintf("recvObject: %v", err)
 		return
@@ -416,9 +423,10 @@ func (a *AgentMode) pairing() {
 func agentMain() {
 	dprintf("srp agent mode")
 	var (
-		remote string
-		target string
-		key    string
+		remote      string
+		target      string
+		key         string
+		idleTimeout time.Duration
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "srp agent [option...]\n\n")
@@ -427,6 +435,7 @@ func agentMain() {
 	flag.StringVar(&remote, "r", "localhost:7771", "remote")
 	flag.StringVar(&target, "t", "", "target")
 	flag.StringVar(&key, "k", "", "key")
+	flag.DurationVar(&idleTimeout, "idle", 3*time.Hour, "idle timeout")
 	flag.Parse()
 
 	rawKey, err := loadKeyData(key)
@@ -435,9 +444,10 @@ func agentMain() {
 	}
 
 	agent := &AgentMode{
-		remote: remote,
-		target: target,
-		key:    rawKey,
+		key:         rawKey,
+		remote:      remote,
+		target:      target,
+		idleTimeout: idleTimeout,
 	}
 
 	go agent.pairing()
