@@ -283,6 +283,8 @@ func (l *LinkMode) handleConn(conn net.Conn) {
 	}
 }
 
+var cmdArgs = os.Args[1:]
+
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format, args...)
 	os.Exit(1)
@@ -306,7 +308,7 @@ func linkMain() {
 	flag.StringVar(&agent, "a", ":7771", "agent")
 	flag.StringVar(&target, "t", "", "target")
 	flag.StringVar(&key, "k", "", "key")
-	flag.Parse()
+	flag.CommandLine.Parse(cmdArgs)
 
 	rawKey, err := loadKeyData(key)
 	if err != nil {
@@ -319,7 +321,7 @@ func linkMain() {
 	}
 	aln, err := net.Listen("tcp", agent)
 	if err != nil {
-		fatalf("listen remote: %v\n", err)
+		fatalf("listen agent: %v\n", err)
 	}
 
 	link := &LinkMode{
@@ -334,7 +336,7 @@ func linkMain() {
 		for {
 			ac, err := aln.Accept()
 			if err != nil {
-				dprintf("remote accept: %v", err)
+				dprintf("agent accept: %v", err)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -465,8 +467,8 @@ func agentMain() {
 	flag.StringVar(&remote, "r", "localhost:7771", "remote")
 	flag.StringVar(&target, "t", "", "target")
 	flag.StringVar(&key, "k", "", "key")
-	flag.DurationVar(&idleTimeout, "idle", 3*time.Hour, "idle timeout")
-	flag.Parse()
+	flag.DurationVar(&idleTimeout, "idleTimeout", 3*time.Hour, "idle timeout")
+	flag.CommandLine.Parse(cmdArgs)
 
 	rawKey, err := loadKeyData(key)
 	if err != nil {
@@ -512,7 +514,7 @@ WantedBy=multi-user.target
 	flag.StringVar(&after, "after", "network-online.target", "Unit.After")
 	flag.StringVar(&restart, "restart", "always", "Service.Restart")
 	flag.UintVar(&restartSec, "restart-sec", 3, "Service.RestartSec")
-	flag.Parse()
+	flag.CommandLine.Parse(cmdArgs)
 
 	cmdline, err := os.Executable()
 	if err == nil {
@@ -544,15 +546,14 @@ command:
 func main() {
 	var cmd string
 
-	args := os.Args
-	if len(args) > 1 && args[1] == "-v" {
+	if len(cmdArgs) > 0 && cmdArgs[0] == "-v" {
 		debugLog = true
-		args = args[1:]
+		cmdArgs = cmdArgs[1:]
 	}
-	if len(args) > 1 {
-		cmd = args[1]
+	if len(cmdArgs) > 0 {
+		cmd = cmdArgs[0]
+		cmdArgs = cmdArgs[1:]
 	}
-	os.Args = args[1:]
 
 	switch cmd {
 	case "link":
