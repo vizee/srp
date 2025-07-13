@@ -41,6 +41,9 @@ func encrypt(buf []byte, plain []byte, key []byte, iv []byte) error {
 }
 
 func decrypt(msg []byte, key []byte, iv []byte) ([]byte, error) {
+	if len(msg) == 0 {
+		return nil, nil
+	}
 	cryptoCipher, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
