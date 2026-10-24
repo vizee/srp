@@ -155,7 +155,7 @@ func agentMain() {
 	flag.StringVar(&remote, "r", "localhost:7771", "remote")
 	flag.StringVar(&target, "t", "", "target address (required on either link or agent; overrides link target)")
 	flag.StringVar(&key, "k", "", "key")
-	flag.DurationVar(&idleTimeout, "idleTimeout", 3*time.Hour, "idle timeout")
+	flag.DurationVar(&idleTimeout, "idleTimeout", 3*time.Hour, "timeout waiting for a dial request (0 disables; active relays are unaffected)")
 	flag.CommandLine.Parse(cmdArgs)
 
 	rawKey, err := loadKeyData(key)
