@@ -41,8 +41,11 @@ func encrypt(buf []byte, plain []byte, key []byte, iv []byte) error {
 }
 
 func decrypt(msg []byte, key []byte, iv []byte) ([]byte, error) {
-	if len(msg) == 0 {
-		return nil, nil
+	if len(msg) == 0 || len(msg)%aes.BlockSize != 0 {
+		return nil, errors.New("bad ciphertext length")
+	}
+	if len(iv) != aes.BlockSize {
+		return nil, errors.New("bad IV length")
 	}
 	cryptoCipher, err := aes.NewCipher(key)
 	if err != nil {
@@ -51,7 +54,16 @@ func decrypt(msg []byte, key []byte, iv []byte) ([]byte, error) {
 	cbc := cipher.NewCBCDecrypter(cryptoCipher, iv)
 	plain := make([]byte, len(msg))
 	cbc.CryptBlocks(plain, msg)
-	return plain[:len(plain)-int(plain[len(plain)-1])], nil
+	padding := int(plain[len(plain)-1])
+	if padding == 0 || padding > aes.BlockSize {
+		return nil, errors.New("bad padding")
+	}
+	for _, b := range plain[len(plain)-padding:] {
+		if int(b) != padding {
+			return nil, errors.New("bad padding")
+		}
+	}
+	return plain[:len(plain)-padding], nil
 }
 
 const (
@@ -100,7 +112,7 @@ func readMessage(conn net.Conn, key []byte) ([]byte, error) {
 	}
 
 	payloadLen := binary.LittleEndian.Uint32(header[:])
-	if payloadLen > maxPayloadLen {
+	if payloadLen == 0 || payloadLen > maxPayloadLen || payloadLen%msgBlockSize != 0 {
 		return nil, errors.New("bad payload length")
 	}
 	iv := header[4 : 4+msgBlockSize]
@@ -131,6 +143,9 @@ func recvHello(conn net.Conn, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(payload) != helloLen+sha1.Size {
+		return nil, errors.New("bad hello length")
+	}
 	sign := sha1.Sum(payload[:helloLen])
 	if !bytes.Equal(payload[helloLen:], sign[:]) {
 		return nil, errors.New("bad sign")
@@ -154,15 +169,49 @@ func recvObject(conn net.Conn, key []byte, obj any) error {
 	return json.Unmarshal(payload, obj)
 }
 
-// pipe 函数持续转发数据，在结束时关闭 dst 连接
+// pipe 在正常 EOF 时只关闭 dst 的写端，使反向数据仍可继续传输。
+// 传输失败时关闭两端，唤醒另一方向的转发协程。
 func pipe(dst net.Conn, src net.Conn) error {
 	_, err := io.Copy(dst, src)
-	// 一般 pipe 成对出现，pipe 只负责关闭 dst
-	dst.Close()
 	if err == io.EOF {
 		err = nil
 	}
+	if err == nil {
+		if conn, ok := dst.(interface{ CloseWrite() error }); ok {
+			err = conn.CloseWrite()
+		} else {
+			err = dst.Close()
+		}
+	}
+	if err != nil {
+		dst.Close()
+		src.Close()
+	}
 	return err
+}
+
+// relay 负责双向转发，并在两个方向结束后关闭连接。
+// preRead 是已从 src 读取的数据，必须先于后续数据写入 dst。
+func relay(dst net.Conn, src net.Conn, preRead []byte) {
+	defer dst.Close()
+	defer src.Close()
+	done := make(chan struct{})
+	go func() {
+		pipe(src, dst)
+		close(done)
+	}()
+
+	if len(preRead) > 0 {
+		if _, err := dst.Write(preRead); err != nil {
+			dprintf("link established, send pre-read failed: %v", err)
+			dst.Close()
+			src.Close()
+			<-done
+			return
+		}
+	}
+	pipe(dst, src)
+	<-done
 }
 
 func loadKeyData(key string) ([]byte, error) {
@@ -253,17 +302,7 @@ func (l *LinkMode) handleAgent(ac net.Conn) {
 		return
 	}
 
-	go pipe(uc.conn, ac)
-
-	if len(uc.preRead) > 0 {
-		_, err := ac.Write(uc.preRead)
-		if err != nil {
-			dprintf("link established, send pre-read failed: %v", err)
-			ac.Close()
-			return
-		}
-	}
-	pipe(ac, uc.conn)
+	relay(ac, uc.conn, uc.preRead)
 }
 
 func (l *LinkMode) handleConn(conn net.Conn) {
@@ -451,8 +490,7 @@ func (a *AgentMode) pairing() {
 		return
 	}
 
-	go pipe(rc, bc)
-	pipe(bc, rc)
+	relay(rc, bc, nil)
 }
 
 func agentMain() {
