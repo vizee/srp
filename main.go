@@ -237,16 +237,22 @@ type LinkMode struct {
 	seqs       uint64
 }
 
-func (l *LinkMode) link(ac net.Conn) (bool, *UserConn) {
+func (l *LinkMode) link(ac net.Conn) (net.Conn, *UserConn) {
 	linkSeq := strconv.FormatUint(atomic.AddUint64(&l.seqs, 1), 10)
 
 	tmpKey, err := recvHello(ac, l.key)
 	if err != nil {
 		dprintf("link[%s] recvHello: %v", linkSeq, err)
-		return false, nil
+		return nil, nil
 	}
+	var session [tmpKeyLen]byte
+	if _, err := io.ReadFull(rand.Reader, session[:]); err != nil {
+		dprintf("link[%s] generate data session: %v", linkSeq, err)
+		return nil, nil
+	}
+	sessionID := base64.StdEncoding.EncodeToString(session[:])
 
-	dprintf("link[%s] received hello: tmpKey=%02x", linkSeq, tmpKey)
+	dprintf("link[%s] received hello", linkSeq)
 
 	// 握手完成后立即启动读协程，保持对连接状态的感知，等待 TCP 或者合法回复
 	agentAck := make(chan bool, 1)
@@ -262,7 +268,9 @@ func (l *LinkMode) link(ac net.Conn) (bool, *UserConn) {
 		}
 		seq, _ := data["seq"].(string)
 		success, _ := data["success"].(bool)
-		agentAck <- seq == linkSeq && success
+		transport, _ := data["transport"].(string)
+		ackSession, _ := data["session"].(string)
+		agentAck <- seq == linkSeq && success && transport == dataTransport && ackSession == sessionID
 	}()
 
 	var uc *UserConn
@@ -270,9 +278,11 @@ func (l *LinkMode) link(ac net.Conn) (bool, *UserConn) {
 	select {
 	case uc = <-l.accept:
 		err := sendObject(ac, tmpKey, map[string]any{
-			"action": "dial",
-			"seq":    linkSeq,
-			"target": l.target,
+			"action":    "dial",
+			"seq":       linkSeq,
+			"target":    l.target,
+			"transport": dataTransport,
+			"session":   sessionID,
 		}, 5*time.Second)
 		if err != nil {
 			dprintf("link[%s] sendObject: %v", linkSeq, err)
@@ -285,16 +295,24 @@ func (l *LinkMode) link(ac net.Conn) (bool, *UserConn) {
 			// 在读协程中 recvJSON 不能设置超时，在这里感知 dial 超时
 			dprintf("link[%s] dial timeout", linkSeq)
 		}
-	case acked = <-agentAck:
+	case <-agentAck:
 		dprintf("link[%s] accept cancel", linkSeq)
 	}
 
-	return acked, uc
+	if !acked {
+		return nil, uc
+	}
+	encrypted, err := newEncryptedConn(ac, tmpKey, session[:], true)
+	if err != nil {
+		dprintf("link[%s] encrypt agent connection: %v", linkSeq, err)
+		return nil, uc
+	}
+	return encrypted, uc
 }
 
 func (l *LinkMode) handleAgent(ac net.Conn) {
-	linked, uc := l.link(ac)
-	if !linked {
+	encrypted, uc := l.link(ac)
+	if encrypted == nil {
 		ac.Close()
 		if uc != nil {
 			uc.conn.Close()
@@ -302,7 +320,7 @@ func (l *LinkMode) handleAgent(ac net.Conn) {
 		return
 	}
 
-	relay(ac, uc.conn, uc.preRead)
+	relay(encrypted, uc.conn, uc.preRead)
 }
 
 func (l *LinkMode) handleConn(conn net.Conn) {
@@ -418,7 +436,10 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 	}
 
 	var tmpKey [tmpKeyLen]byte
-	io.ReadFull(rand.Reader, tmpKey[:])
+	if _, err = io.ReadFull(rand.Reader, tmpKey[:]); err != nil {
+		dprintf("generate session key: %v", err)
+		return
+	}
 
 	err = sendHello(rc, a.key, tmpKey[:])
 	if err != nil {
@@ -426,7 +447,7 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 		return
 	}
 
-	dprintf("sent hello: tmpKey=%02x", tmpKey[:])
+	dprintf("sent hello")
 
 	if a.idleTimeout > 0 {
 		rc.SetReadDeadline(time.Now().Add(a.idleTimeout))
@@ -446,6 +467,17 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 		dprintf("bad action: %s", action)
 		return
 	}
+	transport, _ := data["transport"].(string)
+	if transport != dataTransport {
+		dprintf("unsupported data transport: %s", transport)
+		return
+	}
+	sessionID, _ := data["session"].(string)
+	session, err := base64.StdEncoding.DecodeString(sessionID)
+	if err != nil || len(session) != tmpKeyLen {
+		dprintf("bad data session")
+		return
+	}
 	seq, _ := data["seq"].(string)
 	target, _ := data["target"].(string)
 
@@ -460,14 +492,22 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 	}
 
 	err = sendObject(rc, tmpKey[:], map[string]any{
-		"seq":     seq,
-		"success": true,
+		"seq":       seq,
+		"success":   true,
+		"transport": dataTransport,
+		"session":   sessionID,
 	}, 0)
 	if err != nil {
 		dprintf("sendObject: %v", err)
 		return
 	}
 
+	encrypted, err := newEncryptedConn(rc, tmpKey[:], session, false)
+	if err != nil {
+		dprintf("encrypt remote connection: %v", err)
+		return
+	}
+	rc = encrypted
 	ok = true
 	return
 }
