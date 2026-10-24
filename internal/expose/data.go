@@ -9,7 +9,7 @@ import (
 	"github.com/vizee/srp/internal/transport"
 )
 
-func (s *session) openData(m protocol.Message) {
+func (s *session) openData(m protocol.Message, releaseDialSlot func()) {
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 	target, err := s.dial(ctx, s.cfg.Targets[m.Service])
@@ -25,6 +25,7 @@ func (s *session) openData(m protocol.Message) {
 	for ctx.Err() == nil {
 		stream, err := s.connectData(ctx, m.ID)
 		if err == nil {
+			releaseDialSlot()
 			cancel() // Connection budget is over; established traffic has no idle deadline.
 			defer func() { stream.Close(); s.tracker.Remove(stream.Conn) }()
 			transport.Bridge(s.ctx, stream, target)

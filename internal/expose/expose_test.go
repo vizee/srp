@@ -104,7 +104,7 @@ func TestDialFailureRetriesBeforeHelloSent(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.openData(protocol.Message{Type: "open", Service: "ssh", ID: string(bytes.Repeat([]byte{'a'}, 64))})
+		s.openData(protocol.Message{Type: "open", Service: "ssh", ID: string(bytes.Repeat([]byte{'a'}, 64))}, func() {})
 	}()
 	wait(t, done)
 	if attempts.Load() != 3 {
@@ -136,7 +136,7 @@ func TestNoRetryAfterHelloSent(t *testing.T) {
 		raw.Read(buf)
 		raw.Close()
 	}()
-	s.openData(protocol.Message{Type: "open", Service: "ssh", ID: string(bytes.Repeat([]byte{'b'}, 64))})
+	s.openData(protocol.Message{Type: "open", Service: "ssh", ID: string(bytes.Repeat([]byte{'b'}, 64))}, func() {})
 	if attempts.Load() != 1 {
 		t.Fatalf("replayed sent hello: %d attempts", attempts.Load())
 	}
@@ -196,7 +196,7 @@ func TestControlLossClosesTargetAndData(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.openData(protocol.Message{Type: "open", Service: "ssh", ID: string(bytes.Repeat([]byte{'d'}, 64))})
+		s.openData(protocol.Message{Type: "open", Service: "ssh", ID: string(bytes.Repeat([]byte{'d'}, 64))}, func() {})
 	}()
 	target, e := backend.Accept()
 	if e != nil {
@@ -219,4 +219,130 @@ func TestCancelStopsReconnect(t *testing.T) {
 	go func() { defer close(done); Run(ctx, cfg(t, "127.0.0.1:1", "127.0.0.1:2")) }()
 	cancel()
 	wait(t, done)
+}
+
+func TestEstablishedConnectionsReleaseDialSlots(t *testing.T) {
+	remote, backend := listen(t), listen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSession(ctx, cfg(t, remote.Addr().String(), backend.Addr().String()))
+	defer s.close()
+	s.tasks = make(chan struct{}, 1)
+	s.accepted = map[string]bool{"ssh": true}
+	ready := make(chan error, 2)
+	keys := key(t)
+	replay := protocol.NewReplayCache(20)
+	go func() {
+		for {
+			raw, e := backend.Accept()
+			if e != nil {
+				return
+			}
+			go func() { defer raw.Close(); raw.Write([]byte{'#'}); io.Copy(io.Discard, raw) }()
+		}
+	}()
+	go func() {
+		for {
+			raw, e := remote.Accept()
+			if e != nil {
+				return
+			}
+			go func() {
+				defer raw.Close()
+				stream, _, e := protocol.ServerHandshake(ctx, raw, keys, replay)
+				if e == nil {
+					e = protocol.WriteMessage(stream, protocol.Message{Type: "ready"})
+				}
+				if e == nil {
+					var banner [1]byte
+					_, e = io.ReadFull(stream, banner[:])
+					if e == nil && banner[0] != '#' {
+						e = errors.New("wrong backend banner")
+					}
+				}
+				ready <- e
+				if e == nil {
+					<-ctx.Done()
+				}
+			}()
+		}
+	}()
+	for _, id := range []string{string(bytes.Repeat([]byte{'a'}, 64)), string(bytes.Repeat([]byte{'b'}, 64))} {
+		if e := s.handleMessage(protocol.Message{Type: "open", ID: id, Service: "ssh"}); e != nil {
+			t.Fatal(e)
+		}
+		select {
+		case e := <-ready:
+			if e != nil {
+				t.Fatal(e)
+			}
+		case m := <-s.out:
+			t.Fatalf("active connection retained dial slot: %+v", m)
+		case <-time.After(2 * time.Second):
+			t.Fatal("new connection blocked behind established session")
+		}
+	}
+}
+
+func TestControlCloseWhileTargetDialReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSession(ctx, cfg(t, "127.0.0.1:1", "127.0.0.1:2"))
+	defer s.close()
+	s.accepted = map[string]bool{"ssh": true}
+	entered, release := make(chan struct{}), make(chan struct{})
+	target, peer := net.Pipe()
+	defer peer.Close()
+	s.dial = func(context.Context, string) (net.Conn, error) { close(entered); <-release; return target, nil }
+	if e := s.handleMessage(protocol.Message{Type: "open", ID: string(bytes.Repeat([]byte{'a'}, 64)), Service: "ssh"}); e != nil {
+		t.Fatal(e)
+	}
+	<-entered
+	cancel()
+	s.tracker.Close()
+	close(release)
+	s.wg.Wait()
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, e := peer.Read(make([]byte, 1)); e != io.EOF {
+		t.Fatalf("dial-return race retained target: %v", e)
+	}
+}
+
+func TestControlCloseDuringDataHandshake(t *testing.T) {
+	remote, backend := listen(t), listen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSession(ctx, cfg(t, remote.Addr().String(), backend.Addr().String()))
+	defer s.close()
+	s.accepted = map[string]bool{"ssh": true}
+	sent := make(chan struct{})
+	remoteDone := make(chan struct{})
+	go func() {
+		defer close(remoteDone)
+		raw, e := remote.Accept()
+		if e != nil {
+			return
+		}
+		defer raw.Close()
+		var p [1024]byte
+		raw.Read(p[:])
+		close(sent)
+		io.Copy(io.Discard, raw)
+	}()
+	if e := s.handleMessage(protocol.Message{Type: "open", ID: string(bytes.Repeat([]byte{'b'}, 64)), Service: "ssh"}); e != nil {
+		t.Fatal(e)
+	}
+	target, e := backend.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer target.Close()
+	<-sent
+	cancel()
+	s.wg.Wait()
+	wait(t, remoteDone)
+	target.SetReadDeadline(time.Now().Add(time.Second))
+	if _, e := target.Read(make([]byte, 1)); e != io.EOF {
+		t.Fatalf("incomplete handshake retained target: %v", e)
+	}
 }

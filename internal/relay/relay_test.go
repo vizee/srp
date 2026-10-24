@@ -3,9 +3,11 @@ package relay
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -124,7 +126,10 @@ func TestServiceStartsIdle(t *testing.T) {
 	addr := freeAddr(t)
 	var calls atomic.Int32
 	_, _ = start(t, map[string]string{"ssh": addr}, func(r *Relay) {
-		r.listen = func(n, a string) (net.Listener, error) { calls.Add(1); return net.Listen(n, a) }
+		r.listen = func(ctx context.Context, n, a string) (net.Listener, error) {
+			calls.Add(1)
+			return (&net.ListenConfig{}).Listen(ctx, n, a)
+		}
 	})
 	time.Sleep(30 * time.Millisecond)
 	if calls.Load() != 0 {
@@ -136,7 +141,10 @@ func TestBindFailureRetriesAndStops(t *testing.T) {
 	addr := occupied.Addr().String()
 	var calls atomic.Int32
 	r, remote := start(t, map[string]string{"ssh": addr}, func(r *Relay) {
-		r.listen = func(n, a string) (net.Listener, error) { calls.Add(1); return net.Listen(n, a) }
+		r.listen = func(ctx context.Context, n, a string) (net.Listener, error) {
+			calls.Add(1)
+			return (&net.ListenConfig{}).Listen(ctx, n, a)
+		}
 	})
 	c, m := controlClient(t, remote, "ssh")
 	if m.Type != "ready" || len(m.Accepted) != 1 {
@@ -175,7 +183,10 @@ func TestStopDuringRetry(t *testing.T) {
 	occupied := listen(t)
 	var calls atomic.Int32
 	r, remote := start(t, map[string]string{"ssh": occupied.Addr().String()}, func(r *Relay) {
-		r.listen = func(n, a string) (net.Listener, error) { calls.Add(1); return net.Listen(n, a) }
+		r.listen = func(ctx context.Context, n, a string) (net.Listener, error) {
+			calls.Add(1)
+			return (&net.ListenConfig{}).Listen(ctx, n, a)
+		}
 	})
 	c, _ := controlClient(t, remote, "ssh")
 	await(t, func() bool { return calls.Load() > 0 })
@@ -289,8 +300,8 @@ func TestDuplicateStartAndOldAcceptCannotStopNewListener(t *testing.T) {
 	}()
 	var calls atomic.Int32
 	r, remote := start(t, map[string]string{"ssh": addr}, func(r *Relay) {
-		r.listen = func(n, a string) (net.Listener, error) {
-			ln, e := net.Listen(n, a)
+		r.listen = func(ctx context.Context, n, a string) (net.Listener, error) {
+			ln, e := (&net.ListenConfig{}).Listen(ctx, n, a)
 			if calls.Add(1) == 1 && e == nil {
 				return &delayedAcceptListener{Listener: ln, gate: gate}, nil
 			}
@@ -349,5 +360,192 @@ func TestRapidMembershipChanges(t *testing.T) {
 	r.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("pending requests leaked: %d", n)
+	}
+}
+
+func TestShutdownCancelsServiceDNS(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	oldResolver := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		once.Do(func() { close(entered) })
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+			return nil, errors.New("test resolver released")
+		}
+	}}
+	defer func() { net.DefaultResolver = oldResolver }()
+	defer close(release)
+	r, e := New(Config{Keys: key(t), Services: map[string]string{"ssh": "shutdown-test.invalid:12345"}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	ln := listen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Serve(ctx, ln) }()
+	control, _ := controlClient(t, ln.Addr().String(), "ssh")
+	defer control.Close()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("DNS lookup did not start")
+	}
+	cancel()
+	select {
+	case e := <-done:
+		if e != nil {
+			t.Fatal(e)
+		}
+	case <-time.After(time.Second):
+		t.Error("relay shutdown blocked in service DNS resolution")
+	}
+}
+
+func TestUnauthenticatedDataCannotConsumePending(t *testing.T) {
+	r, remote := start(t, map[string]string{"ssh": freeAddr(t)}, nil)
+	control, _ := controlClient(t, remote, "ssh")
+	await(t, func() bool { return memberCount(r, "ssh") == 1 })
+	source, peer := net.Pipe()
+	defer peer.Close()
+	r.handleUser(r.services["ssh"], source, new(atomic.Bool))
+	m, e := protocol.ReadMessage(control)
+	if e != nil {
+		t.Fatal(e)
+	}
+	wrong, _ := protocol.NewKeys(bytes.Repeat([]byte{3}, 32))
+	for _, tc := range []struct {
+		keys  *protocol.Keys
+		hello protocol.Hello
+	}{
+		{wrong, protocol.Hello{Type: "data", ID: m.ID}},
+		{key(t), protocol.Hello{Type: "data", ID: m.ID, TimestampMS: time.Now().Add(20 * time.Second).UnixMilli()}},
+		{wrong, protocol.Hello{Type: "control", Services: []string{"ssh"}}},
+	} {
+		raw, e := net.Dial("tcp", remote)
+		if e != nil {
+			t.Fatal(e)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, e = protocol.ClientHandshake(ctx, raw, tc.keys, tc.hello)
+		raw.Close()
+		cancel()
+		if e == nil {
+			t.Fatal("unauthenticated hello accepted")
+		}
+	}
+	r.mu.Lock()
+	_, exists := r.pending[m.ID]
+	members := len(r.services["ssh"].members)
+	r.mu.Unlock()
+	if !exists || members != 1 {
+		t.Fatal("failed authentication changed registration or consumed ID")
+	}
+	data, ready := dataClient(t, remote, m.ID)
+	defer data.Close()
+	if ready.Type != "ready" {
+		t.Fatal("legitimate data lost pending ID")
+	}
+}
+
+func TestBlockedReadyDoesNotParticipateInDispatch(t *testing.T) {
+	r, remote := start(t, map[string]string{"ssh": freeAddr(t)}, nil)
+	first, _ := controlClient(t, remote, "ssh")
+	await(t, func() bool { return memberCount(r, "ssh") == 1 })
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		s, h, e := protocol.ServerHandshake(r.ctx, server, r.cfg.Keys, r.replay)
+		if e == nil {
+			r.serveControl(s, h)
+		}
+	}()
+	second, e := protocol.ClientHandshake(r.ctx, client, r.cfg.Keys, protocol.Hello{Type: "control", Services: []string{"ssh"}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	await(t, func() bool { r.mu.Lock(); defer r.mu.Unlock(); return len(r.controls) == 2 })
+	for i := 0; i < 2; i++ {
+		source, peer := net.Pipe()
+		defer peer.Close()
+		r.handleUser(r.services["ssh"], source, new(atomic.Bool))
+		first.SetReadDeadline(time.Now().Add(time.Second))
+		m, e := protocol.ReadMessage(first)
+		if e != nil || m.Type != "open" {
+			t.Fatalf("blocked ready received work: %+v %v", m, e)
+		}
+	}
+	second.SetReadDeadline(time.Now().Add(time.Second))
+	m, e := protocol.ReadMessage(second)
+	if e != nil || m.Type != "ready" {
+		t.Fatalf("ready order: %+v %v", m, e)
+	}
+	await(t, func() bool { return memberCount(r, "ssh") == 2 })
+	second.Close()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("second control did not exit")
+	}
+}
+
+func TestPendingClaimTimeoutAndControlCloseCompete(t *testing.T) {
+	r, remote := start(t, map[string]string{"ssh": freeAddr(t)}, nil)
+	for trial := 0; trial < 10; trial++ {
+		control, _ := controlClient(t, remote, "ssh")
+		await(t, func() bool { return memberCount(r, "ssh") == 1 })
+		source, peer := net.Pipe()
+		r.handleUser(r.services["ssh"], source, new(atomic.Bool))
+		m, e := protocol.ReadMessage(control)
+		if e != nil {
+			t.Fatal(e)
+		}
+		r.mu.Lock()
+		owner := r.pending[m.ID].owner
+		r.mu.Unlock()
+		gate := make(chan struct{})
+		var workers sync.WaitGroup
+		workers.Add(3)
+		go func() { defer workers.Done(); <-gate; r.release(m.ID, owner) }()
+		go func() { defer workers.Done(); <-gate; control.Close() }()
+		go func() {
+			defer workers.Done()
+			<-gate
+			raw, e := net.Dial("tcp", remote)
+			if e != nil {
+				return
+			}
+			defer raw.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			s, e := protocol.ClientHandshake(ctx, raw, r.cfg.Keys, protocol.Hello{Type: "data", ID: m.ID})
+			if e != nil {
+				return
+			}
+			s.SetReadDeadline(time.Now().Add(time.Second))
+			ready, e := protocol.ReadMessage(s)
+			if e == nil && ready.Type == "ready" {
+				s.SetReadDeadline(time.Now().Add(time.Second))
+				_, e := s.Read(make([]byte, 1))
+				var timeout net.Error
+				if e == nil || (errors.As(e, &timeout) && timeout.Timeout()) {
+					t.Error("racing control close left data alive")
+				}
+			}
+		}()
+		close(gate)
+		workers.Wait()
+		peer.SetReadDeadline(time.Now().Add(time.Second))
+		if _, e := peer.Read(make([]byte, 1)); e != io.EOF {
+			t.Fatalf("source not closed: %v", e)
+		}
+		peer.Close()
+		await(t, func() bool { r.mu.Lock(); defer r.mu.Unlock(); return len(r.pending) == 0 && len(r.controls) == 0 })
 	}
 }

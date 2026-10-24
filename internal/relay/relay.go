@@ -31,7 +31,7 @@ type Relay struct {
 	wg         sync.WaitGroup
 	handshakes chan struct{}
 	ctx        context.Context
-	listen     func(string, string) (net.Listener, error)
+	listen     func(context.Context, string, string) (net.Listener, error)
 	pendingTTL time.Duration
 }
 
@@ -42,7 +42,7 @@ func New(cfg Config) (*Relay, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(io.Discard, "", 0)
 	}
-	r := &Relay{cfg: cfg, services: make(map[string]*service), controls: make(map[*control]struct{}), pending: make(map[string]*pending), replay: protocol.NewReplayCache(65536), handshakes: make(chan struct{}, 256), listen: net.Listen, pendingTTL: 15 * time.Second}
+	r := &Relay{cfg: cfg, services: make(map[string]*service), controls: make(map[*control]struct{}), pending: make(map[string]*pending), replay: protocol.NewReplayCache(65536), handshakes: make(chan struct{}, 256), listen: (&net.ListenConfig{}).Listen, pendingTTL: 15 * time.Second}
 	for name, addr := range cfg.Services {
 		r.services[name] = &service{relay: r, name: name, addr: addr, event: make(chan serviceEvent, 1)}
 	}

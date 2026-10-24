@@ -45,7 +45,12 @@ func (s *session) handleMessage(m protocol.Message) error {
 		return nil
 	}
 	s.wg.Add(1)
-	go func() { defer s.wg.Done(); defer func() { <-s.tasks }(); s.openData(m) }()
+	go func() {
+		defer s.wg.Done()
+		releaseDialSlot := sync.OnceFunc(func() { <-s.tasks })
+		defer releaseDialSlot()
+		s.openData(m, releaseDialSlot)
+	}()
 	return nil
 }
 func (s *session) report(m protocol.Message, code string) {

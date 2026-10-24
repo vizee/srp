@@ -63,7 +63,7 @@ func (s *service) manage(ctx context.Context) {
 		if currListener != nil {
 			return
 		}
-		ln, err := s.relay.listen("tcp", s.addr)
+		ln, err := s.relay.listen(ctx, "tcp", s.addr)
 		if err != nil {
 			s.relay.cfg.Logger.Printf("warning: service %s listen %s: %v; retry in 1s", s.name, s.addr, err)
 			startTicker()

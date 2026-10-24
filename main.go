@@ -60,7 +60,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = expose.Run(ctx, expose.Config{Keys: keys, Remote: o.Remote, Targets: o.Services, Logger: logger, Verbose: o.Verbose})
 	} else {
 		var ln net.Listener
-		ln, err = net.Listen("tcp", o.Listen)
+		ln, err = (&net.ListenConfig{}).Listen(ctx, "tcp", o.Listen)
 		if err == nil {
 			logger.Printf("relay tunnel listening on %s", ln.Addr())
 			var r *relay.Relay
@@ -71,6 +71,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 				ln.Close()
 			}
 		}
+	}
+	if ctx.Err() != nil {
+		return 0
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "srp: %v\n", err)
