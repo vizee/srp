@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"time"
 )
 
@@ -79,6 +80,17 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 	if a.target != "" {
 		target = a.target
 	}
+	if target == "" {
+		const message = "target is required: set -t on link or agent"
+		fmt.Fprintln(os.Stderr, message)
+		if err := sendObject(rc, tmpKey[:], map[string]any{
+			"seq": seq, "success": false, "error": message,
+			"transport": dataTransport, "session": sessionID,
+		}, time.Second); err != nil {
+			dprintf("send dial failure: %v", err)
+		}
+		return
+	}
 
 	bc, err = net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
@@ -141,7 +153,7 @@ func agentMain() {
 		flag.PrintDefaults()
 	}
 	flag.StringVar(&remote, "r", "localhost:7771", "remote")
-	flag.StringVar(&target, "t", "", "target")
+	flag.StringVar(&target, "t", "", "target address (required on either link or agent; overrides link target)")
 	flag.StringVar(&key, "k", "", "key")
 	flag.DurationVar(&idleTimeout, "idleTimeout", 3*time.Hour, "idle timeout")
 	flag.CommandLine.Parse(cmdArgs)

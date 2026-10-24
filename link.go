@@ -148,7 +148,7 @@ func linkMain() {
 	flag.UintVar(&preReadNum, "preRead", 0, "pre-read bytes")
 	flag.StringVar(&listen, "l", ":7770", "listen")
 	flag.StringVar(&agent, "a", ":7771", "agent")
-	flag.StringVar(&target, "t", "", "target")
+	flag.StringVar(&target, "t", "", "default target address (required on either link or agent)")
 	flag.StringVar(&key, "k", "", "key")
 	flag.CommandLine.Parse(cmdArgs)
 
