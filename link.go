@@ -122,6 +122,7 @@ func (l *LinkMode) handleConn(conn net.Conn) {
 		conn.SetReadDeadline(time.Time{})
 		if err != nil {
 			conn.Close()
+			return
 		}
 	}
 	select {
