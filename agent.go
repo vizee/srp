@@ -19,7 +19,7 @@ type AgentMode struct {
 
 func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 	var err error
-	rc, err = net.Dial("tcp", a.remote)
+	rc, err = net.DialTimeout("tcp", a.remote, 10*time.Second)
 	if err != nil {
 		dprintf("net.Dial %s: %v", a.remote, err)
 		return
@@ -80,7 +80,7 @@ func (a *AgentMode) connectAndPair() (rc net.Conn, bc net.Conn, ok bool) {
 		target = a.target
 	}
 
-	bc, err = net.Dial("tcp", target)
+	bc, err = net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
 		dprintf("net.Dial %s: %v", target, err)
 		return
