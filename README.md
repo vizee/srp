@@ -1,202 +1,152 @@
-# srp
+# srp v2.0
 
-Simple Reverse Proxy，一个使用 Go 标准库实现的 TCP 反向代理。内网侧主动连接公网节点，将本地服务通过加密隧道暴露给外部客户端。
+零配置文件的 TCP 反向代理。内网侧运行 `expose`，公网侧运行 `relay`；一个 expose 可提供多个命名服务，多个 expose 可共同提供同一服务，relay 按连接次数独立轮询。
 
-## 工作原理
-
-程序包含两个角色：
-
-- **link**：运行在外部可访问的主机上，分别监听用户端口和 agent 接入端口。
-- **agent**：运行在能够访问目标服务的主机上，主动连接 link，并根据请求连接目标服务。
-
-```text
-外部客户端 <-- TCP --> Host A / link:7770
-                              |
-                       加密 TCP 隧道 :7771
-                              |
-                      Host B / agent <-- TCP --> 目标服务
-```
-
-agent 主动连接 Host A 的 `7771` 端口，内网侧无需开放入站端口。每条用户连接独占一条隧道，配对成功后 agent 会补充新的待命连接。支持并发连接和 TCP 半关闭；客户端结束发送后，仍可继续接收目标服务的响应。
-
-srp 转发 TCP 字节流，可用于 HTTP、SSH 等基于 TCP 的服务；不支持 UDP。
+v2 完全重新开发，不兼容旧命令和旧线协议。只提供 `expose`、`relay`、`version`，不读取运行配置文件。
 
 ## 构建
 
-需要 Go 1.20 或更高版本。在项目目录执行：
+需要 Go 1.24 或更新版本，仅使用标准库。
 
 ```sh
 go build -o srp .
+./srp version
 ```
 
-## 快速开始
+## 共享密钥
 
-假设 Host A 是公网主机，Host B 上有一个监听 `127.0.0.1:80` 的 HTTP 服务。
-
-### 1. 生成共享密钥
+两端部署同一份原始二进制密钥文件，支持 16、24、32 字节，推荐生成 32 字节：
 
 ```sh
+install -d -m 700 "$HOME/.config/srp"
 umask 077
-openssl rand -out srp.key 32
+openssl rand -out "$HOME/.config/srp/default.key" 32
 ```
 
-将同一个 `srp.key` 文件放到 Host A 和 Host B。后续命令中的 `@./srp.key` 表示从文件读取原始密钥。
+把生成的文件安全复制到另一端；不要在两端分别生成不同的密钥。不指定 `-k` 时读取 `$HOME/.config/srp/default.key`。程序不会自动生成密钥，不对文件进行 trim 或 Base64 解码；`-k` 直接接受文件路径，不使用旧版的 `@` 前缀。
 
-### 2. 在 Host A 启动 link
+## 运行
+
+公网 relay：
 
 ```sh
-./srp link -k @./srp.key
+./srp relay -k /path/to/shared.key -l :7770 \
+  -s 'ssh=:8022,myweb=100.100.100.100:18080,egress.baidu=127.0.0.1:443'
 ```
 
-默认使用 `:7770` 接收客户端连接，使用 `:7771` 接收 agent 连接。允许客户端访问 Host A 的 TCP `7770` 端口，并允许 Host B 访问 TCP `7771` 端口。
-
-### 3. 在 Host B 启动 agent
-
-将 `HOST_A` 替换为 Host A 的 IP 地址或域名：
+能够访问目标服务的 expose：
 
 ```sh
-./srp agent -k @./srp.key -r HOST_A:7771 -t 127.0.0.1:80
+./srp expose -k /path/to/shared.key -r 100.100.100.100:7770 \
+  -t 'ssh=127.0.0.1:22,myweb=192.168.1.11:8080,egress.baidu=www.baidu.com:443'
 ```
 
-### 4. 访问目标服务
-
-在能够访问 Host A 的客户端执行：
+服务名两端对应；真实目标地址只由 expose 保存、解析及连接，不会传给 relay。
 
 ```sh
-curl http://HOST_A:7770/
+ssh -p 8022 user@100.100.100.100
+curl http://100.100.100.100:18080/
 ```
 
-请求经 Host A 转发到 Host B 的 `127.0.0.1:80`。
+`100.100.100.100` 必须是 relay 主机可使用的地址。relay 上绑定 `127.0.0.1:443` 的服务仅对该主机本地开放。需要允许 expose 访问隧道 TCP 7770，以及客户端访问相应服务端口。
 
-## 命令与参数
+## 参数
 
 ```text
-srp [-v] <command> [options]
+srp [-v] expose [-k key-file] [-r host:7770] -t service=host:port,...
+srp [-v] relay  [-k key-file] [-l :7770]    -s service=host:port,...
+srp version
 ```
-
-`-v` 开启调试日志，必须放在子命令前，例如：
-
-```sh
-./srp -v agent -k @./srp.key -r HOST_A:7771 -t 127.0.0.1:80
-```
-
-使用 `./srp link -h`、`./srp agent -h` 或 `./srp systemd-service -h` 查看对应帮助。
-
-### link
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `-l` | `:7770` | 客户端连接的监听地址 |
-| `-a` | `:7771` | agent 连接的监听地址 |
-| `-k` | 空 | 共享密钥，两端需配置相同的值 |
-| `-t` | 空 | 下发给 agent 的默认目标地址 |
-| `-preRead` | `0` | 配对前从客户端读取的字节数；`0` 表示不预读 |
+| `-k` | `$HOME/.config/srp/default.key` | 原始共享密钥文件路径 |
+| expose `-r` | `127.0.0.1:7770` | relay 隧道入口 |
+| expose `-t` | 必填 | 多个服务名与目标地址 |
+| relay `-l` | `:7770` | 控制与数据连接共用的隧道入口 |
+| relay `-s` | 必填 | 多个服务名与监听地址 |
+| `-v` | 关闭 | 额外记录握手及数据建连失败，放在子命令前 |
 
-例如，使用自定义端口转发 SSH：
+服务名区分大小写，仅允许 1–128 个 ASCII 字母、数字、点、下划线、短横线；每次最多配置 256 个服务。同一次命令中服务名不能重复。地址使用 `host:port`，IPv6 例如 `ssh=[::1]:22`；端口必须为 1–65535。监听 host 可以为空，目标 host 必须明确指定。密钥文件路径可包含空格，使用 shell 引号即可。
 
-```sh
-# Host A
-./srp link -k @./srp.key -l :2222 -a :7771
+## 注册、监听与故障处理
 
-# Host B
-./srp agent -k @./srp.key -r HOST_A:7771 -t 127.0.0.1:22
+- relay 启动只监听隧道入口。服务首次有 expose 注册时才开启监听；最后一个 expose 注销后停止监听。
+- 每个服务由独立管理协程管理 listener。bind 失败记录警告并每秒重试，注册、心跳和其他服务仍正常；端口释放后自动恢复。
+- expose 声明但 relay 未配置的服务列为 ignored 并记录日志；若没有任何匹配服务则拒绝注册。
+- 多个 expose 提供相同服务时按新客户端连接轮询，不按流量或并发数加权。
+- 每条客户端连接对应一条独立的数据隧道；不复用 TCP 字节流，不迁移已建立会话。
+- 控制连接双方每 5 秒 heartbeat，7 秒未收到 heartbeat 即断开。控制关闭会注销服务并关闭其所有待配对及已建立的数据会话，业务客户端需自行重连。
+- expose 自动重连控制连接，退避约 1、2、4、8、最高 10 秒，加少量抖动；稳定连接 30 秒后复位。
+- 数据连接在完整握手首包发送成功前发生建连/发送失败可在预算内重试；完整首包发送成功后，该数据 ID 不再重试。未知、超时、已使用的 ID 直接拒绝。
+- 目标拨号最多 5 秒；一次 open 总预算 10 秒；relay 等待配对最多 15 秒。新隧道认证握手最多 5 秒。
+- 已建立业务连接没有额外空闲超时，支持 TCP 半关闭。客户端发送结束后可以继续接收响应，配对前 CloseWrite 也不会提前释放 ID。
+- SIGINT/SIGTERM 关闭 listener、控制连接及所有业务连接，清理协程后退出，不等待业务排空。
 
-# 外部客户端
-ssh -p 2222 user@HOST_A
+仅转发 TCP，不支持 UDP、HTTP 路由或转发原始客户端 IP；目标看到的 TCP 对端是 expose。
+
+## 协议与认证加密
+
+首包格式：
+
+```text
+IV[16] | AES-CTR(nonce[24] | JSON长度[4] | JSON | HMAC-SHA256[32])
 ```
 
-### agent
+HMAC 覆盖 IV、nonce、长度和 JSON，使用与 CTR 独立派生的密钥，不叠加 CRC。握手只包含版本、控制/数据类型、服务名或一次性数据 ID、客户端 Unix 毫秒时间。
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-r` | `localhost:7771` | link 的 agent 接入地址，对应 link 的 `-a` |
-| `-t` | 空 | 目标服务地址；设置后覆盖 link 下发的 `-t` |
-| `-k` | 空 | 共享密钥，两端需配置相同的值 |
-| `-idleTimeout` | `3h` | 待命连接等待拨号指令的超时；`0` 禁用；不限制已建立的业务连接 |
+时间领先或落后达到 10 秒即拒绝，部署两端需保持系统时间同步。relay 全局原子查重 nonce，内存保留 20 秒；控制/数据连接共用表，连接关闭不提前删除。随机服务端挑战与加密确认验证当前会话，避免只重放首包就注册或消费数据 ID，也保护 relay 重启后 nonce 缓存为空的情况。
 
-目标地址始终由 **agent 所在主机** 解析和连接。例如，无论 `127.0.0.1:80` 配置在 link 还是 agent 上，都指向 agent 所在主机。两端至少有一端需要设置 `-t`；如果最终目标为空，agent 会打印配置错误并向 link 返回配对失败。
+双方使用标准库 HKDF-SHA256，为每条连接的两个方向独立派生 AES-256-GCM 密钥；后续控制消息和业务流均经过认证加密。GCM 记录使用递增序号、认证长度及认证 EOF，单记录最多 32 KiB，每方向最多 2^32 个记录，达到上限关闭连接。
 
-agent 连接 link 的超时为 10 秒，拨号目标服务的超时为 5 秒；连接或配对失败后间隔 1 秒重试。`-idleTimeout` 仅限制待命阶段，不限制已经建立的业务连接。
+加密覆盖 expose ↔ relay。客户端 ↔ relay、expose ↔ 目标这两段沿用业务原有协议。共享同一密钥的节点属于同一信任域，服务名不是租户隔离凭证；该方案不提供前向保密。
 
-### 预读
+## 资源上限
 
-`link -preRead N` 会等待客户端先发送完整的 `N` 字节，再将连接交给 agent。预读数据会在配对后先行加密转发，不会丢弃。
+| 资源 | 上限 |
+| --- | --- |
+| 并发隧道认证握手 | relay 256 |
+| 全局 nonce 表 | 65536 条，保留 20 秒 |
+| relay 待配对请求 | 4096 |
+| 每控制连接待配对请求 | 256 |
+| 每 expose 并发数据任务 | 256 |
+| 控制消息发送队列 | 256 |
+| 握手与控制 JSON | 65536 字节 |
 
-预读超时为 3 秒，未读满会关闭客户端连接。对于需要服务端先发送数据的协议，应保留默认的 `-preRead 0`。客户端连接等待可用 agent 的时间最多为 30 秒。
+达到上限时拒绝新请求，不提前驱逐仍有效的 nonce。活动数据连接受操作系统资源限制。所有容量均为内置值，无运行配置文件。
 
-## 密钥与加密
+## systemd 示例
 
-### 共享密钥
+把二进制放在最终路径，密钥使用绝对路径，然后手动安装 unit，例如 expose：
 
-link 和 agent 均需通过 `-k` 配置共享密钥，支持两种形式：
+```ini
+[Unit]
+Description=srp expose
+After=network-online.target
+Wants=network-online.target
 
-| 形式 | 示例 | 读取方式 |
-| --- | --- | --- |
-| 密钥文件 | `-k @./srp.key` | 直接读取文件中的原始字节 |
-| Base64 字符串 | `-k BASE64_KEY` | 将参数按标准 Base64 解码 |
+[Service]
+ExecStart=/usr/local/bin/srp expose -k /etc/srp/shared.key -r 100.100.100.100:7770 -t ssh=127.0.0.1:22
+Restart=always
+RestartSec=3
 
-解码或读取后的密钥长度必须为 **16、24 或 32 字节**。`-k` 不是口令，程序不会从任意文本派生密钥；密钥文件内容也不会再次进行 Base64 解码。快速开始中生成的是 32 字节二进制密钥。
-
-### 业务会话密钥
-
-业务数据不直接使用 `-k` 加密：
-
-1. agent 为每条隧道生成 16 字节随机临时密钥，通过共享密钥加密的握手发送给 link。
-2. link 生成 16 字节随机会话标识，通过临时密钥加密的控制通道发送给 agent，并要求在确认消息中回传。
-3. 双方使用 HMAC-SHA256，根据临时密钥、会话标识及方向标签，派生两个 32 字节 AES-GCM 密钥，分别保护 link → agent 和 agent → link 的业务数据。
-
-握手和控制消息采用 AES-CBC 封装。业务数据使用 AES-GCM，每帧最多携带 32 KiB 明文，预读数据也经过相同加密。独立的方向密钥、递增的 nonce 和认证结束帧用于检测数据篡改、帧重放、顺序异常及流截断，同时保留半关闭语义。
-
-加密覆盖 **link ↔ agent** 的隧道。客户端 ↔ link、agent ↔ 目标服务这两段沿用业务原有协议；业务自身使用的 HTTPS、SSH 等加密会继续保留。
-
-### 版本兼容
-
-当前业务传输协议为 `aes-gcm-v1`。**link 和 agent 必须同步升级**；旧版本或不支持该协议的对端会被拒绝，不会回退到明文转发。
-
-## systemd
-
-`systemd-service` 输出 service unit 文本，不会自动安装或启动服务。生成的 `ExecStart` 使用当前程序的绝对路径，因此应先把二进制放到最终安装位置。程序路径和各个参数会分别加引号，并处理 systemd 的变量和说明符转义，避免空格、`$` 或 `%` 改变解析结果；参数中的引号、反斜线和换行也会转义。
-
-以下为在 Host B 安装 agent 服务的示例，使用与 Host A 相同的密钥文件：
-
-```sh
-sudo install -m 755 ./srp /usr/local/bin/srp
-sudo install -d -m 700 /etc/srp
-sudo install -m 600 ./srp.key /etc/srp/srp.key
-
-/usr/local/bin/srp systemd-service agent \
-  -k @/etc/srp/srp.key \
-  -r HOST_A:7771 \
-  -t 127.0.0.1:80 > srp-agent.service
-
-sudo install -m 644 srp-agent.service /etc/systemd/system/srp-agent.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now srp-agent.service
+[Install]
+WantedBy=multi-user.target
 ```
 
-生成 link 的 unit 时，将 `agent` 及其参数替换为 `link` 及对应参数。
+程序不生成或安装 unit。注意运行用户读取默认密钥的 HOME 可能与交互用户不同，服务中建议显式指定密钥路径。
 
-| 生成参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-after` | `network-online.target` | unit 的 `After` |
-| `-restart` | `always` | 服务重启策略 |
-| `-restart-sec` | `3` | 重启间隔，单位为秒 |
-
-这些生成参数必须放在服务子命令之前，例如：
-
-```sh
-./srp systemd-service -restart-sec 5 agent -k @/etc/srp/srp.key -r HOST_A:7771 -t 127.0.0.1:80
-```
-
-## 测试
+## 验证
 
 ```sh
 go test ./...
 go test -race ./...
 go vet ./...
+go test ./internal/protocol -run '^$' -fuzz FuzzReadHello -fuzztime 5s
+go test ./internal/protocol -run '^$' -fuzz FuzzReadMessage -fuzztime 5s
 ```
 
-部分测试会监听本机 TCP 端口，运行环境需要允许创建本地 socket。
+测试需要允许本机 loopback TCP socket。包含真实心跳与超时验收，完整测试需要十余秒。
 
 ## 许可证
 
