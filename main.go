@@ -8,9 +8,9 @@ import (
 
 var debugLog = false
 
-func dprintf(foramt string, args ...any) {
+func dprintf(format string, args ...any) {
 	if debugLog {
-		fmt.Printf(foramt+"\n", args...)
+		fmt.Printf(format+"\n", args...)
 	}
 }
 
