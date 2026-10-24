@@ -5,8 +5,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
+
+func systemdCommandLine(executable string, args []string) string {
+	// Specifiers are expanded in both the executable path and arguments.
+	words := []string{strconv.Quote(strings.ReplaceAll(executable, "%", "%%"))}
+	for _, arg := range args {
+		// Environment expansion applies to arguments, not the executable path.
+		arg = strings.ReplaceAll(arg, "$", "$$")
+		arg = strings.ReplaceAll(arg, "%", "%%")
+		words = append(words, strconv.Quote(arg))
+	}
+	return strings.Join(words, " ")
+}
 
 func printSystemdService() {
 	const serviceContent = `[Unit]
@@ -45,10 +58,5 @@ WantedBy=multi-user.target
 		fatalf("cannot get path of the program:%v", err)
 	}
 
-	args := strings.Join(flag.Args(), " ")
-	if args != "" {
-		cmdline += " " + args
-	}
-
-	fmt.Printf(serviceContent, after, cmdline, restart, restartSec)
+	fmt.Printf(serviceContent, after, systemdCommandLine(cmdline, flag.Args()), restart, restartSec)
 }

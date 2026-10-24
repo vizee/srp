@@ -155,7 +155,7 @@ link 和 agent 均需通过 `-k` 配置共享密钥，支持两种形式：
 
 ## systemd
 
-`systemd-service` 输出 service unit 文本，不会自动安装或启动服务。生成的 `ExecStart` 使用当前程序的绝对路径，因此应先把二进制放到最终安装位置。
+`systemd-service` 输出 service unit 文本，不会自动安装或启动服务。生成的 `ExecStart` 使用当前程序的绝对路径，因此应先把二进制放到最终安装位置。程序路径和各个参数会分别加引号，并处理 systemd 的变量和说明符转义，避免空格、`$` 或 `%` 改变解析结果；参数中的引号、反斜线和换行也会转义。
 
 以下为在 Host B 安装 agent 服务的示例，使用与 Host A 相同的密钥文件：
 
