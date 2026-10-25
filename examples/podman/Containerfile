@@ -1,0 +1,21 @@
+ARG GO_IMAGE=docker.io/library/golang:1.24-alpine
+ARG ALPINE_IMAGE=docker.io/library/alpine:3.23
+
+FROM ${GO_IMAGE} AS build
+WORKDIR /src
+COPY go.mod ./
+COPY main.go ./
+COPY internal/ ./internal/
+RUN CGO_ENABLED=0 go build -trimpath -o /out/srp .
+
+FROM ${ALPINE_IMAGE} AS srp
+COPY --from=build /out/srp /usr/local/bin/srp
+ENTRYPOINT ["/usr/local/bin/srp"]
+
+FROM ${ALPINE_IMAGE} AS backend
+RUN apk add --no-cache openssh-server busybox-extras \
+    && adduser -D -s /bin/sh demo \
+    && passwd -d demo
+COPY examples/podman/sshd_config /etc/ssh/sshd_config
+COPY examples/podman/backend.sh /usr/local/bin/backend
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/backend"]

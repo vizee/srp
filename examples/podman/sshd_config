@@ -1,0 +1,11 @@
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile .ssh/authorized_keys
+AllowUsers demo
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PrintMotd no
+LogLevel INFO

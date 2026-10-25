@@ -50,6 +50,15 @@ curl http://100.100.100.100:18080/
 
 `100.100.100.100` 必须是 relay 主机可使用的地址。relay 上绑定 `127.0.0.1:443` 的服务仅对该主机本地开放。需要允许 expose 访问隧道 TCP 7770，以及客户端访问相应服务端口。
 
+## Podman 完整示例
+
+[examples/podman](examples/podman/README.md) 提供两个 expose、两个真实 HTTP/SSH 后端和一个 relay，包含一键启动、轮询与动态监听验证、日志查看和清理脚本。
+
+```sh
+./examples/podman/demo.sh up
+./examples/podman/demo.sh check
+```
+
 ## 参数
 
 ```text
