@@ -64,7 +64,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if err == nil {
 			logger.Printf("relay tunnel listening on %s", ln.Addr())
 			var r *relay.Relay
-			r, err = relay.New(relay.Config{Keys: keys, Services: o.Services, Logger: logger, Verbose: o.Verbose})
+			r, err = relay.New(relay.Config{Keys: keys, Services: o.Services, Logger: logger, Verbose: o.Verbose, MaxPreflightConns: o.MaxPreflightConns})
 			if err == nil {
 				err = r.Serve(ctx, ln)
 			} else {

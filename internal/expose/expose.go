@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/vizee/srp/internal/protocol"
@@ -35,9 +36,11 @@ func Run(ctx context.Context, cfg Config) error {
 		targets[name] = addr
 	}
 	cfg.Targets = targets
+	var pools sync.WaitGroup
+	defer pools.Wait()
 	backoff := time.Second
 	for ctx.Err() == nil {
-		stable, err := runSession(ctx, cfg)
+		stable, err := runSession(ctx, cfg, &pools)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -54,7 +57,7 @@ func Run(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-func runSession(parent context.Context, cfg Config) (time.Duration, error) {
+func runSession(parent context.Context, cfg Config, pools *sync.WaitGroup) (time.Duration, error) {
 	s := newSession(parent, cfg)
 	defer s.close()
 	raw, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(s.ctx, "tcp", cfg.Remote)
@@ -99,6 +102,10 @@ func runSession(parent context.Context, cfg Config) (time.Duration, error) {
 	if len(seen) != len(names) {
 		return 0, errors.New("incomplete service registration response")
 	}
+	if !protocol.ValidID(ready.PreflightKey) || ready.MaxPreflightConns < 1 || ready.MaxPreflightConns > protocol.LimitMaxPreflightConns {
+		return 0, errors.New("invalid preflight registration response")
+	}
+	s.pool = newPreflightPool(parent, s.ctx, cfg, s.dial, ready.PreflightKey, ready.MaxPreflightConns, pools)
 	cfg.Logger.Printf("services registered accepted=%v ignored=%v", ready.Accepted, ready.Ignored)
 	activeAt := time.Now()
 	err = protocol.RunControl(s.ctx, stream, s.out, s.handleMessage)

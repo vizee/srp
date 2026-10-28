@@ -82,6 +82,8 @@ func TestDialFailureRetriesBeforeHelloSent(t *testing.T) {
 	defer cancel()
 	s := newSession(ctx, cfg(t, remote.Addr().String(), backend.Addr().String()))
 	defer s.close()
+	// An existing but empty pool must retain the direct data connection path.
+	s.pool = &preflightPool{refill: ctx, idle: make(map[*preflightConn]struct{})}
 	var attempts atomic.Int32
 	realDial := s.dial
 	s.dial = func(ctx context.Context, addr string) (net.Conn, error) {

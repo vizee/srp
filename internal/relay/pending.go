@@ -75,14 +75,19 @@ func (r *Relay) release(id string, owner *control) {
 	p.client.Close()
 }
 func (r *Relay) serveData(s *protocol.Stream, h protocol.Hello) {
+	r.serveDataFor(s, h.ID, nil, nil)
+}
+
+// owner is required for upgrades; a preflight cannot claim another control's ID.
+func (r *Relay) serveDataFor(s *protocol.Stream, id string, owner *control, onClaim func()) {
 	r.mu.Lock()
-	p := r.pending[h.ID]
-	if p == nil || !p.owner.active || p.owner.ctx.Err() != nil || !time.Now().Before(p.expires) {
+	p := r.pending[id]
+	if p == nil || (owner != nil && (p.owner != owner || r.preflightKeys[owner.preflightKey] != owner)) || !p.owner.active || p.owner.ctx.Err() != nil || !time.Now().Before(p.expires) {
 		r.mu.Unlock()
 		sendReady(s, protocol.Message{Type: "error", Code: "invalid_data_id"})
 		return
 	}
-	delete(r.pending, h.ID)
+	delete(r.pending, id)
 	p.owner.pendingCount--
 	p.timer.Stop()
 	added := p.owner.tracker.Add(s)
@@ -97,6 +102,10 @@ func (r *Relay) serveData(s *protocol.Stream, h protocol.Hello) {
 	if !added {
 		return
 	}
+	if onClaim != nil {
+		onClaim()
+	}
+	s.SetDeadline(time.Time{})
 	if err := sendReady(s, protocol.Message{Type: "ready"}); err != nil {
 		return
 	}

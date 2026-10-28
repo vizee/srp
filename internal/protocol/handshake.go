@@ -20,11 +20,12 @@ import (
 )
 
 type Hello struct {
-	Version     int      `json:"version"`
-	Type        string   `json:"type"`
-	TimestampMS int64    `json:"timestamp_ms"`
-	Services    []string `json:"services,omitempty"`
-	ID          string   `json:"id,omitempty"`
+	Version      int      `json:"version"`
+	Type         string   `json:"type"`
+	TimestampMS  int64    `json:"timestamp_ms"`
+	Services     []string `json:"services,omitempty"`
+	ID           string   `json:"id,omitempty"`
+	PreflightKey string   `json:"preflight_key,omitempty"`
 }
 type HandshakeError struct {
 	Sent bool
@@ -126,7 +127,7 @@ func validateHello(h Hello, now time.Time) error {
 	}
 	switch h.Type {
 	case "control":
-		if h.ID != "" || len(h.Services) == 0 || len(h.Services) > 256 {
+		if h.ID != "" || h.PreflightKey != "" || len(h.Services) == 0 || len(h.Services) > 256 {
 			return errors.New("invalid control handshake")
 		}
 		seen := make(map[string]bool)
@@ -137,8 +138,12 @@ func validateHello(h Hello, now time.Time) error {
 			seen[name] = true
 		}
 	case "data":
-		if !ValidID(h.ID) || len(h.Services) != 0 {
+		if !ValidID(h.ID) || h.PreflightKey != "" || len(h.Services) != 0 {
 			return errors.New("invalid data handshake")
+		}
+	case "preflight":
+		if !ValidID(h.PreflightKey) || h.ID != "" || len(h.Services) != 0 {
+			return errors.New("invalid preflight handshake")
 		}
 	default:
 		return errors.New("unknown connection type")

@@ -12,12 +12,15 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/vizee/srp/internal/protocol"
 )
 
 type Options struct {
 	Mode, KeyPath, Remote, Listen string
 	Services                      map[string]string
 	Verbose                       bool
+	MaxPreflightConns             int
 }
 
 var serviceName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
@@ -51,6 +54,7 @@ func Parse(args []string, home string) (Options, error) {
 		fs.StringVar(&mappings, "t", "", "service=target mappings")
 	} else {
 		fs.StringVar(&o.Listen, "l", ":7770", "tunnel listen address")
+		fs.IntVar(&o.MaxPreflightConns, "max-preflight-conns", protocol.DefaultMaxPreflightConns, "maximum idle preflight connections per control (1-256)")
 		fs.StringVar(&mappings, "s", "", "service=listen mappings")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
@@ -58,6 +62,9 @@ func Parse(args []string, home string) (Options, error) {
 	}
 	if fs.NArg() != 0 {
 		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if o.Mode == "relay" && (o.MaxPreflightConns < 1 || o.MaxPreflightConns > protocol.LimitMaxPreflightConns) {
+		return o, errors.New("max-preflight-conns must be between 1 and 256")
 	}
 	if o.KeyPath == "" {
 		return o, errors.New("key file path is empty")
@@ -122,7 +129,7 @@ func Help(mode string) string {
 	case "expose":
 		return "srp expose [-k key-file] [-r host:7770] -t service=host:port,...\n"
 	case "relay":
-		return "srp relay [-k key-file] [-l :7770] -s service=host:port,...\n"
+		return "srp relay [-k key-file] [-l :7770] [-max-preflight-conns 8] -s service=host:port,...\n"
 	default:
 		return "srp [-v] <expose|relay|version> [options]\n\n" + Help("expose") + Help("relay") + "\nDefault key: $HOME/.config/srp/default.key (16, 24 or 32 raw bytes)\n"
 	}

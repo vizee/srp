@@ -22,6 +22,7 @@ type session struct {
 	tasks    chan struct{}
 	accepted map[string]bool
 	dial     func(context.Context, string) (net.Conn, error)
+	pool     *preflightPool
 }
 
 func newSession(parent context.Context, cfg Config) *session {

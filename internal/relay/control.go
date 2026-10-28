@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"sort"
 
@@ -10,14 +12,16 @@ import (
 )
 
 type control struct {
-	stream       *protocol.Stream
-	ctx          context.Context
-	cancel       context.CancelFunc
-	out          chan protocol.Message
-	tracker      transport.Tracker
-	names        []string
-	active       bool // guarded by relay.mu
-	pendingCount int  // guarded by relay.mu
+	stream         *protocol.Stream
+	ctx            context.Context
+	cancel         context.CancelFunc
+	out            chan protocol.Message
+	tracker        transport.Tracker
+	names          []string
+	active         bool // guarded by relay.mu
+	pendingCount   int  // guarded by relay.mu
+	preflightKey   string
+	preflightCount int // guarded by relay.mu
 }
 
 func (r *Relay) serveControl(s *protocol.Stream, h protocol.Hello) {
@@ -39,10 +43,16 @@ func (r *Relay) serveControl(s *protocol.Stream, h protocol.Hello) {
 		sendReady(s, protocol.Message{Type: "error", Code: "no_matching_services"})
 		return
 	}
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return
+	}
+	c.preflightKey = hex.EncodeToString(key[:])
 	r.mu.Lock()
 	r.controls[c] = struct{}{}
+	r.preflightKeys[c.preflightKey] = c
 	r.mu.Unlock()
-	if err := sendReady(s, protocol.Message{Type: "ready", Accepted: c.names, Ignored: ignored}); err != nil {
+	if err := sendReady(s, protocol.Message{Type: "ready", Accepted: c.names, Ignored: ignored, PreflightKey: c.preflightKey, MaxPreflightConns: r.cfg.MaxPreflightConns}); err != nil {
 		return
 	}
 	r.mu.Lock()
@@ -76,6 +86,7 @@ func (r *Relay) removeControl(c *control) {
 	r.mu.Lock()
 	c.active = false
 	delete(r.controls, c)
+	delete(r.preflightKeys, c.preflightKey)
 	for _, name := range c.names {
 		s := r.services[name]
 		for i, member := range s.members {

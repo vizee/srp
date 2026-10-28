@@ -15,34 +15,43 @@ import (
 )
 
 type Config struct {
-	Keys     *protocol.Keys
-	Services map[string]string
-	Logger   *log.Logger
-	Verbose  bool
+	Keys              *protocol.Keys
+	Services          map[string]string
+	Logger            *log.Logger
+	Verbose           bool
+	MaxPreflightConns int
 }
 type Relay struct {
-	cfg        Config
-	mu         sync.Mutex
-	services   map[string]*service
-	controls   map[*control]struct{}
-	pending    map[string]*pending
-	replay     *protocol.ReplayCache
-	tracker    transport.Tracker
-	wg         sync.WaitGroup
-	handshakes chan struct{}
-	ctx        context.Context
-	listen     func(context.Context, string, string) (net.Listener, error)
-	pendingTTL time.Duration
+	cfg           Config
+	mu            sync.Mutex
+	services      map[string]*service
+	controls      map[*control]struct{}
+	preflightKeys map[string]*control
+	pending       map[string]*pending
+	replay        *protocol.ReplayCache
+	tracker       transport.Tracker
+	wg            sync.WaitGroup
+	handshakes    chan struct{}
+	ctx           context.Context
+	listen        func(context.Context, string, string) (net.Listener, error)
+	pendingTTL    time.Duration
 }
 
 func New(cfg Config) (*Relay, error) {
 	if cfg.Keys == nil || len(cfg.Services) == 0 {
 		return nil, errors.New("relay requires keys and services")
 	}
+	if cfg.MaxPreflightConns == 0 {
+		cfg.MaxPreflightConns = protocol.DefaultMaxPreflightConns
+	}
+	if cfg.MaxPreflightConns < 1 || cfg.MaxPreflightConns > protocol.LimitMaxPreflightConns {
+		return nil, errors.New("max preflight connections must be between 1 and 256")
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(io.Discard, "", 0)
 	}
 	r := &Relay{cfg: cfg, services: make(map[string]*service), controls: make(map[*control]struct{}), pending: make(map[string]*pending), replay: protocol.NewReplayCache(65536), handshakes: make(chan struct{}, 256), listen: (&net.ListenConfig{}).Listen, pendingTTL: 15 * time.Second}
+	r.preflightKeys = make(map[string]*control)
 	for name, addr := range cfg.Services {
 		r.services[name] = &service{relay: r, name: name, addr: addr, event: make(chan serviceEvent, 1)}
 	}
@@ -93,6 +102,8 @@ func (r *Relay) Serve(parent context.Context, ln net.Listener) error {
 				r.serveControl(s, h)
 			case "data":
 				r.serveData(s, h)
+			case "preflight":
+				r.servePreflight(s, h)
 			}
 		}()
 	}

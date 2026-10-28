@@ -7,6 +7,27 @@ import (
 	"testing"
 )
 
+func TestMaxPreflightConns(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{{"", 8}, {"1", 1}, {"256", 256}} {
+		args := []string{"relay", "-s", "ssh=:22"}
+		if tc.value != "" {
+			args = append(args, "-max-preflight-conns", tc.value)
+		}
+		o, err := Parse(args, "/tmp")
+		if err != nil || o.MaxPreflightConns != tc.want {
+			t.Fatalf("%+v %v", o, err)
+		}
+	}
+	for _, value := range []string{"0", "-1", "257", "bad"} {
+		if _, err := Parse([]string{"relay", "-s", "ssh=:22", "-max-preflight-conns", value}, "/tmp"); err == nil {
+			t.Fatalf("accepted %s", value)
+		}
+	}
+}
+
 func TestParseExamples(t *testing.T) {
 	for _, tc := range []struct {
 		args       []string

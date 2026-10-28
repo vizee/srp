@@ -48,6 +48,15 @@ func (s *session) openData(m protocol.Message, releaseDialSlot func()) {
 }
 
 func (s *session) connectData(ctx context.Context, id string) (stream *protocol.Stream, err error) {
+	if stream, found, err := s.pool.take(ctx, id); found {
+		if err != nil {
+			return nil, err
+		}
+		if !s.tracker.Add(stream.Conn) {
+			return nil, s.ctx.Err()
+		}
+		return stream, nil
+	}
 	raw, err := s.dial(ctx, s.cfg.Remote)
 	if err != nil {
 		return nil, err

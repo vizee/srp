@@ -63,7 +63,7 @@ curl http://100.100.100.100:18080/
 
 ```text
 srp [-v] expose [-k key-file] [-r host:7770] -t service=host:port,...
-srp [-v] relay  [-k key-file] [-l :7770]    -s service=host:port,...
+srp [-v] relay  [-k key-file] [-l :7770] [-max-preflight-conns 8] -s service=host:port,...
 srp version
 ```
 
@@ -74,6 +74,7 @@ srp version
 | expose `-t` | 必填 | 多个服务名与目标地址 |
 | relay `-l` | `:7770` | 控制与数据连接共用的隧道入口 |
 | relay `-s` | 必填 | 多个服务名与监听地址 |
+| relay `-max-preflight-conns` | `8` | 每个控制连接的空闲 preflight 连接上限，范围 1–256 |
 | `-v` | 关闭 | 额外记录握手及数据建连失败，放在子命令前 |
 
 服务名区分大小写，仅允许 1–128 个 ASCII 字母、数字、点、下划线、短横线；每次最多配置 256 个服务。同一次命令中服务名不能重复。地址使用 `host:port`，IPv6 例如 `ssh=[::1]:22`；端口必须为 1–65535。监听 host 可以为空，目标 host 必须明确指定。密钥文件路径可包含空格，使用 shell 引号即可。
@@ -85,9 +86,12 @@ srp version
 - expose 声明但 relay 未配置的服务列为 ignored 并记录日志；若没有任何匹配服务则拒绝注册。
 - 多个 expose 提供相同服务时按新客户端连接轮询，不按流量或并发数加权。
 - 每条客户端连接对应一条独立的数据隧道；不复用 TCP 字节流，不迁移已建立会话。
+- 控制注册成功后，relay 返回该控制连接专属的随机 `preflight_key` 和 `max_preflight_conns`。expose 预先建立不超过该上限的空闲 preflight 连接，连接被使用或断开后自动补池；补建失败每秒重试。
+- 收到 open 通知时，expose 优先选取空闲 preflight 连接，发送带一次性数据 ID 的 `upgrade` 包；relay 校验 ID 属于该控制连接，回复 ready 后双方开始业务传输。池空时保留直接新建 data 连接的流程。升级沿用该连接的加密会话，停止 preflight 心跳并清除空闲超时。
+- 空闲 preflight 每 5 秒发送包含自身 `preflight_key` 的 heartbeat，relay 校验 key 并回复；10 秒（两倍心跳间隔）未收到心跳即关闭。控制关闭时 relay 释放 key，两端均不主动关闭其空闲 preflight，后续心跳因 key 失效而关闭；expose 停止补充旧池。进程退出会立即关闭所有连接。
 - 控制连接双方每 5 秒 heartbeat，7 秒未收到 heartbeat 即断开。控制关闭会注销服务并关闭其所有待配对及已建立的数据会话，业务客户端需自行重连。
 - expose 自动重连控制连接，退避约 1、2、4、8、最高 10 秒，加少量抖动；稳定连接 30 秒后复位。
-- 数据连接在完整握手首包发送成功前发生建连/发送失败可在预算内重试；完整首包发送成功后，该数据 ID 不再重试。未知、超时、已使用的 ID 直接拒绝。
+- 直接新建数据连接在完整握手首包发送成功前发生建连/发送失败可在预算内重试；完整首包发送成功后，该数据 ID 不再重试。preflight 一旦尝试发送 upgrade，也不重试该 ID。未知、超时、已使用或与 preflight 所属控制连接不匹配的 ID 直接拒绝。
 - 目标拨号最多 5 秒；一次 open 总预算 10 秒；relay 等待配对最多 15 秒。新隧道认证握手最多 5 秒。
 - 已建立业务连接没有额外空闲超时，支持 TCP 半关闭。客户端发送结束后可以继续接收响应，配对前 CloseWrite 也不会提前释放 ID。
 - SIGINT/SIGTERM 关闭 listener、控制连接及所有业务连接，清理协程后退出，不等待业务排空。
@@ -102,9 +106,9 @@ srp version
 IV[16] | AES-CTR(nonce[24] | JSON长度[4] | JSON | HMAC-SHA256[32])
 ```
 
-HMAC 覆盖 IV、nonce、长度和 JSON，使用与 CTR 独立派生的密钥，不叠加 CRC。握手只包含版本、控制/数据类型、服务名或一次性数据 ID、客户端 Unix 毫秒时间。
+HMAC 覆盖 IV、nonce、长度和 JSON，使用与 CTR 独立派生的密钥，不叠加 CRC。握手包含版本、连接类型、客户端 Unix 毫秒时间，以及该类型对应的信息：control 的服务名、data 的一次性数据 ID，或 preflight 的 `preflight_key`。控制连接的 ready 响应新增 `preflight_key` 和 `max_preflight_conns`，expose 与 relay 应配套更新。
 
-时间领先或落后达到 10 秒即拒绝，部署两端需保持系统时间同步。relay 全局原子查重 nonce，内存保留 20 秒；控制/数据连接共用表，连接关闭不提前删除。随机服务端挑战与加密确认验证当前会话，避免只重放首包就注册或消费数据 ID，也保护 relay 重启后 nonce 缓存为空的情况。
+时间领先或落后达到 10 秒即拒绝，部署两端需保持系统时间同步。relay 全局原子查重 nonce，内存保留 20 秒；control、data 和 preflight 连接共用表，连接关闭不提前删除。随机服务端挑战与加密确认验证当前会话，避免只重放首包就注册或消费数据 ID，也保护 relay 重启后 nonce 缓存为空的情况。
 
 双方使用标准库 HKDF-SHA256，为每条连接的两个方向独立派生 AES-256-GCM 密钥；后续控制消息和业务流均经过认证加密。GCM 记录使用递增序号、认证长度及认证 EOF，单记录最多 32 KiB，每方向最多 2^32 个记录，达到上限关闭连接。
 
@@ -118,11 +122,12 @@ HMAC 覆盖 IV、nonce、长度和 JSON，使用与 CTR 独立派生的密钥，
 | 全局 nonce 表 | 65536 条，保留 20 秒 |
 | relay 待配对请求 | 4096 |
 | 每控制连接待配对请求 | 256 |
+| 每控制连接空闲 preflight | 默认 8，relay `-max-preflight-conns` 可设为 1–256；升级后立即释放槽位 |
 | 每 expose 并发目标拨号/数据握手 | 256，ready 后释放槽位 |
 | 控制消息发送队列 | 256 |
 | 握手与控制 JSON | 65536 字节 |
 
-达到上限时拒绝新请求，不提前驱逐仍有效的 nonce。活动数据连接受操作系统资源限制。所有容量均为内置值，无运行配置文件。
+达到上限时拒绝新请求，不提前驱逐仍有效的 nonce。活动数据连接受操作系统资源限制。除 preflight 上限可用命令行设置外，其余容量均为内置值，无运行配置文件。
 
 ## systemd 示例
 

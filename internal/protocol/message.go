@@ -8,14 +8,18 @@ import (
 )
 
 const MaxMessageSize = 65536
+const DefaultMaxPreflightConns = 8
+const LimitMaxPreflightConns = 256
 
 type Message struct {
-	Type     string   `json:"type"`
-	ID       string   `json:"id,omitempty"`
-	Service  string   `json:"service,omitempty"`
-	Code     string   `json:"code,omitempty"`
-	Accepted []string `json:"accepted,omitempty"`
-	Ignored  []string `json:"ignored,omitempty"`
+	Type              string   `json:"type"`
+	ID                string   `json:"id,omitempty"`
+	Service           string   `json:"service,omitempty"`
+	Code              string   `json:"code,omitempty"`
+	Accepted          []string `json:"accepted,omitempty"`
+	Ignored           []string `json:"ignored,omitempty"`
+	PreflightKey      string   `json:"preflight_key,omitempty"`
+	MaxPreflightConns int      `json:"max_preflight_conns,omitempty"`
 }
 
 func WriteMessage(w io.Writer, m Message) error {
